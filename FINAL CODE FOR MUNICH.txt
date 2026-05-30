@@ -1,0 +1,454 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================================================
+# Battery Degradation-Aware PV-BESS EMS and Sizing
+# Case Study: Munich, Germany
+# =========================================================
+
+YEARS = 15
+HOURS = 8760
+
+CITY = "Munich, Germany"
+LATITUDE = 48.1351
+LONGITUDE = 11.5820
+
+# Munich assumptions
+annual_load_kwh = 4500
+pv_size_kwp = 6
+munich_pv_yield = 1050      # kWh/kWp/year for Munich
+grid_price = 0.40           # EUR/kWh
+feed_in_tariff = 0.08       # EUR/kWh
+discount_rate = 0.04
+
+pv_capex_per_kwp = 1300
+pv_om_per_year = 120
+
+battery_sizes = np.arange(2, 15, 2)
+base_battery_size = 8
+replacement_threshold = 0.70
+
+battery_types = {
+    "New Li-ion": {
+        "cost": 650,
+        "initial_soh": 1.00,
+        "calendar_fade": 0.018,
+        "cycle_fade": 0.000055,
+        "efficiency": 0.92,
+        "max_dod": 0.90,
+    },
+    "Second-life EV": {
+        "cost": 330,
+        "initial_soh": 0.82,
+        "calendar_fade": 0.030,
+        "cycle_fade": 0.000085,
+        "efficiency": 0.88,
+        "max_dod": 0.80,
+    },
+}
+
+pv_capex = pv_size_kwp * pv_capex_per_kwp
+
+
+# =========================================================
+# Munich Synthetic PV and Household Load Profile
+# =========================================================
+def create_munich_profiles():
+    np.random.seed(42)
+
+    time = pd.date_range("2026-01-01", periods=HOURS, freq="h")
+    hour = time.hour.values
+    day = time.dayofyear.values
+
+    # Household load profile
+    morning_peak = 0.4 * np.exp(-0.5 * ((hour - 7) / 2) ** 2)
+    evening_peak = 1.0 * np.exp(-0.5 * ((hour - 19) / 3) ** 2)
+    winter_factor = 1 + 0.22 * np.cos(2 * np.pi * (day - 15) / 365)
+
+    load = 0.35 + morning_peak + evening_peak
+    load = load * winter_factor * np.random.normal(1, 0.08, HOURS)
+    load = load * annual_load_kwh / load.sum()
+
+    # Munich PV profile
+    daylight = np.maximum(0, np.sin(np.pi * (hour - 6) / 14))
+    seasonal_factor = np.maximum(0.08, np.sin(np.pi * (day - 20) / 365))
+
+    # Munich has better PV yield than northern Germany
+    cloud_factor = np.clip(np.random.normal(0.92, 0.20, HOURS), 0.25, 1.25)
+
+    pv = daylight * seasonal_factor * cloud_factor
+    pv = pv * (pv_size_kwp * munich_pv_yield) / pv.sum()
+
+    return pd.DataFrame({"load": load, "pv": pv}, index=time)
+
+
+# =========================================================
+# PV-BESS Simulation
+# =========================================================
+def simulate_bess(profile, battery_size, battery_name):
+    battery = battery_types[battery_name]
+
+    soh = battery["initial_soh"]
+    efficiency = battery["efficiency"]
+
+    charge_eff = np.sqrt(efficiency)
+    discharge_eff = np.sqrt(efficiency)
+
+    min_soc_fraction = 1 - battery["max_dod"]
+    soc = 0.5 * battery_size * soh
+
+    yearly_results = []
+    hourly_soc = []
+    hourly_dod = []
+
+    initial_capex = pv_capex + battery_size * battery["cost"]
+    cumulative_cashflow = -initial_capex
+    replacement_year = None
+
+    for year in range(1, YEARS + 1):
+        usable_capacity = battery_size * soh
+        min_soc = min_soc_fraction * usable_capacity
+        max_soc = usable_capacity
+
+        soc = np.clip(soc, min_soc, max_soc)
+
+        grid_import = 0
+        grid_export = 0
+        self_consumed = 0
+        battery_throughput = 0
+
+        soc_year = []
+        dod_year = []
+
+        for load, pv in zip(profile["load"], profile["pv"]):
+            surplus = pv - load
+
+            if surplus >= 0:
+                charge = min(surplus * charge_eff, max_soc - soc)
+                soc += charge
+
+                export = surplus - charge / charge_eff
+                import_energy = 0
+
+                self_consumed += load
+                battery_throughput += charge
+
+            else:
+                deficit = -surplus
+                discharge = min(deficit / discharge_eff, soc - min_soc)
+                soc -= discharge
+
+                import_energy = deficit - discharge * discharge_eff
+                export = 0
+
+                self_consumed += pv + discharge * discharge_eff
+                battery_throughput += discharge
+
+            grid_import += import_energy
+            grid_export += export
+
+            soc_fraction = soc / max_soc
+            dod_fraction = 1 - soc_fraction
+
+            soc_year.append(soc_fraction)
+            dod_year.append(dod_fraction)
+
+            if year == 1 and battery_size == base_battery_size:
+                hourly_soc.append(soc_fraction)
+                hourly_dod.append(dod_fraction)
+
+        equivalent_cycles = battery_throughput / (2 * usable_capacity)
+
+        degradation = (
+            battery["calendar_fade"]
+            + battery["cycle_fade"] * equivalent_cycles
+        )
+
+        soh_next = max(0.40, soh - degradation)
+
+        replacement_cost = 0
+
+        if soh_next < replacement_threshold and replacement_year is None and year < YEARS:
+            replacement_year = year + 1
+            replacement_cost = battery_size * battery["cost"]
+            soh_next = battery["initial_soh"]
+
+        baseline_cost = annual_load_kwh * grid_price
+
+        annual_bill = (
+            grid_import * grid_price
+            - grid_export * feed_in_tariff
+            + pv_om_per_year
+            + replacement_cost
+        )
+
+        annual_savings = baseline_cost - annual_bill
+        discounted_savings = annual_savings / ((1 + discount_rate) ** year)
+        cumulative_cashflow += discounted_savings
+
+        yearly_results.append({
+            "battery": battery_name,
+            "battery_size": battery_size,
+            "year": year,
+            "soh": soh_next,
+            "mean_soc": np.mean(soc_year),
+            "mean_dod": np.mean(dod_year),
+            "max_dod": np.max(dod_year),
+            "cycles": equivalent_cycles,
+            "grid_import": grid_import,
+            "grid_export": grid_export,
+            "self_consumed": self_consumed,
+            "annual_savings": annual_savings,
+            "cashflow": cumulative_cashflow,
+            "replacement_year": replacement_year if replacement_year else 16,
+            "replacement_cost": replacement_cost,
+            "capex": initial_capex,
+        })
+
+        soh = soh_next
+
+    return pd.DataFrame(yearly_results), hourly_soc, hourly_dod
+
+
+# =========================================================
+# LCOE and Payback
+# =========================================================
+def calculate_lcoe_payback(results):
+    updated_results = []
+
+    for (battery_name, size), group in results.groupby(["battery", "battery_size"]):
+        battery = battery_types[battery_name]
+
+        capex = pv_capex + size * battery["cost"]
+        discounted_cost = capex
+        discounted_energy = 0
+        payback = 0
+
+        for _, row in group.iterrows():
+            year = row["year"]
+
+            discounted_cost += (
+                pv_om_per_year + row["replacement_cost"]
+            ) / ((1 + discount_rate) ** year)
+
+            discounted_energy += row["self_consumed"] / ((1 + discount_rate) ** year)
+
+            if payback == 0 and row["cashflow"] >= 0:
+                payback = year
+
+        lcoe = discounted_cost / discounted_energy
+
+        temp = group.copy()
+        temp["lcoe"] = lcoe
+        temp["payback"] = payback
+
+        updated_results.append(temp)
+
+    return pd.concat(updated_results)
+
+
+# =========================================================
+# Frequency Support Simulation
+# =========================================================
+def frequency_support_simulation():
+    hours = np.arange(24)
+
+    frequency = (
+        50
+        + 0.06 * np.sin(2 * np.pi * hours / 8)
+        - 0.12 * np.exp(-0.5 * ((hours - 18) / 2) ** 2)
+    )
+
+    support_power = np.clip((50 - frequency) * base_battery_size * 0.9, -2.5, 2.5)
+
+    corrected_frequency = frequency + 0.035 * support_power
+
+    return pd.DataFrame({
+        "hour": hours,
+        "frequency": frequency,
+        "support_power": support_power,
+        "corrected_frequency": corrected_frequency,
+    })
+
+
+# =========================================================
+# Run Simulation
+# =========================================================
+profile = create_munich_profiles()
+
+all_results = []
+base_soc = None
+base_dod = None
+
+for battery in battery_types:
+    for size in battery_sizes:
+        yearly, soc, dod = simulate_bess(profile, size, battery)
+        all_results.append(yearly)
+
+        if battery == "New Li-ion" and size == base_battery_size:
+            base_soc = soc
+            base_dod = dod
+
+results = pd.concat(all_results)
+results = calculate_lcoe_payback(results)
+
+final_results = results[results["year"] == YEARS]
+frequency_data = frequency_support_simulation()
+
+
+# =========================================================
+# Plot 9 Graphs
+# =========================================================
+plt.style.use("seaborn-v0_8-whitegrid")
+
+# 1. Munich PV and load profile
+week = profile.iloc[24 * 120:24 * 127]
+
+plt.figure(figsize=(10, 4))
+plt.plot(week.index, week["load"], label="Munich Household Load")
+plt.plot(week.index, week["pv"], label="Munich PV Generation")
+plt.title("1. Munich PV and Household Load Profile")
+plt.ylabel("Energy (kWh)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 2. SOC tracking
+plt.figure(figsize=(10, 4))
+plt.plot(base_soc[:24 * 7], color="green")
+plt.title("2. Battery SOC Tracking in Munich")
+plt.xlabel("Hour")
+plt.ylabel("SOC")
+plt.tight_layout()
+plt.show()
+
+# 3. Depth of discharge
+plt.figure(figsize=(10, 4))
+plt.plot(base_dod[:24 * 7], color="red")
+plt.title("3. Battery Depth of Discharge in Munich")
+plt.xlabel("Hour")
+plt.ylabel("DOD")
+plt.tight_layout()
+plt.show()
+
+# 4. Battery degradation over 15 years
+plt.figure(figsize=(8, 4))
+
+for battery in battery_types:
+    data = results[
+        (results["battery"] == battery)
+        & (results["battery_size"] == base_battery_size)
+    ]
+    plt.plot(data["year"], data["soh"] * 100, marker="o", label=battery)
+
+plt.axhline(
+    replacement_threshold * 100,
+    linestyle="--",
+    color="black",
+    label="Replacement Threshold"
+)
+
+plt.title("4. Battery Degradation Over 15 Years - Munich")
+plt.xlabel("Year")
+plt.ylabel("State of Health (%)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 5. Battery replacement year
+plt.figure(figsize=(8, 4))
+
+for battery in battery_types:
+    data = final_results[final_results["battery"] == battery]
+    plt.plot(data["battery_size"], data["replacement_year"], marker="o", label=battery)
+
+plt.title("5. Battery Replacement Year - Munich")
+plt.xlabel("Battery Size (kWh)")
+plt.ylabel("Replacement Year, 16 = No Replacement")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 6. Payback year
+plt.figure(figsize=(8, 4))
+
+for battery in battery_types:
+    data = final_results[final_results["battery"] == battery]
+    plt.plot(data["battery_size"], data["payback"], marker="o", label=battery)
+
+plt.title("6. Payback Year - Munich")
+plt.xlabel("Battery Size (kWh)")
+plt.ylabel("Payback Year, 0 = No Payback")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 7. LCOE impact
+plt.figure(figsize=(8, 4))
+
+for battery in battery_types:
+    data = final_results[final_results["battery"] == battery]
+    plt.plot(data["battery_size"], data["lcoe"], marker="o", label=battery)
+
+plt.title("7. LCOE Impact - Munich PV-BESS")
+plt.xlabel("Battery Size (kWh)")
+plt.ylabel("LCOE (EUR/kWh)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 8. New vs second-life battery comparison
+comparison = final_results[final_results["battery_size"] == base_battery_size]
+
+x = np.arange(len(comparison))
+
+plt.figure(figsize=(8, 4))
+plt.bar(x, comparison["capex"])
+plt.xticks(x, comparison["battery"])
+plt.title("8. New vs Second-Life EV Battery CAPEX - Munich")
+plt.ylabel("EUR")
+plt.tight_layout()
+plt.show()
+
+# 9. Frequency support simulation
+plt.figure(figsize=(9, 4))
+
+plt.plot(
+    frequency_data["hour"],
+    frequency_data["frequency"],
+    marker="o",
+    label="Original Frequency"
+)
+
+plt.plot(
+    frequency_data["hour"],
+    frequency_data["corrected_frequency"],
+    marker="o",
+    label="With BESS Support"
+)
+
+plt.axhline(50, linestyle="--", color="black")
+plt.title("9. Simple Frequency Support Simulation - Munich")
+plt.xlabel("Hour")
+plt.ylabel("Frequency (Hz)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# =========================================================
+# Optimizer Result
+# =========================================================
+best = final_results.sort_values("lcoe").iloc[0]
+
+print("Best Munich PV-BESS Option")
+print("--------------------------")
+print("City:", CITY)
+print("Latitude:", LATITUDE)
+print("Longitude:", LONGITUDE)
+print("Battery Type:", best["battery"])
+print("Battery Size:", best["battery_size"], "kWh")
+print("LCOE:", round(best["lcoe"], 3), "EUR/kWh")
+print("Payback Year:", int(best["payback"]))
+print("Replacement Year:", int(best["replacement_year"]))
